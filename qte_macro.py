@@ -23,6 +23,7 @@ import os
 import sys
 import json
 import argparse
+from datetime import datetime
 from typing import Optional, Tuple, Dict, Any, List
 
 try:
@@ -33,6 +34,11 @@ except ImportError:
     sys.exit(1)
 
 _cached_hdesk = None
+
+# Precomputed trigonometric polar sampling tables for high FPS polling (>100 FPS)
+_TRIG_360 = [(math.cos(math.radians(d)), math.sin(math.radians(d))) for d in range(360)]
+_TRIG_RING = [(math.cos(math.radians(d)), math.sin(math.radians(d))) for d in range(0, 360, 10)]
+_TRIG_720 = [(math.cos(math.radians(i * 0.5)), math.sin(math.radians(i * 0.5))) for i in range(720)]
 
 
 # Ensure UTF-8 output encoding on Windows consoles
@@ -411,6 +417,514 @@ class ScreenCapture:
 
 
 # ============================================================================
+# Configuration & Persistence
+# ============================================================================
+
+DEFAULT_CONFIG = {
+    "resolution": None,
+    "center_override": None,
+    "top_bar_offset": 0,
+    "crop_size": 320,
+    "hit_position": "start",
+    "lead_degrees": 0.0,
+    "offset_degrees": 0.0,
+    "latency_ms": 0.0,
+    "speed_calibration": [
+        {"speed": 250, "latency_ms": 14.96},
+        {"speed": 350, "latency_ms": 14.96},
+        {"speed": 500, "latency_ms": 14.96},
+        {"speed": 700, "latency_ms": 14.96},
+        {"speed": 1000, "latency_ms": 14.96}
+    ],
+    "verbose_logging": False,
+    "min_needle_score": 35.0,
+    "hold_duration_ms": 35,
+    "debounce_seconds": 0.08,
+    "poll_interval_ms": 0,
+    "trigger_delay_ms": 0,
+    "toggle_key": "F1",
+    "exit_key": "F2",
+    "status_interval_ms": 250
+}
+
+def resolve_config_path(config_path: str = "config.json") -> str:
+    """Resolve config file path, checking cwd first then next to executable/script."""
+    if os.path.isabs(config_path):
+        return config_path
+    if os.path.exists(config_path):
+        return os.path.abspath(config_path)
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(base_dir, config_path)
+    if os.path.exists(candidate):
+        return candidate
+    return os.path.abspath(config_path)
+
+def update_persisted_config(updates: Dict[str, Any], config_path: str = "config.json") -> bool:
+    """Safely and atomically update keys in config.json while preserving all existing config fields."""
+    target_path = resolve_config_path(config_path)
+    try:
+        data = {}
+        if os.path.exists(target_path):
+            with open(target_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        data.update(updates)
+        temp_path = f"{target_path}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        os.replace(temp_path, target_path)
+        return True
+    except Exception:
+        return False
+
+def load_or_create_config(config_path: str = "config.json") -> Dict[str, Any]:
+    """Load configuration from JSON, or generate default config file if missing."""
+    target_path = resolve_config_path(config_path)
+    if not os.path.exists(target_path):
+        try:
+            with open(target_path, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=4)
+            print(f"[CONFIG] Created default configuration file: {target_path}")
+        except Exception as e:
+            print(f"[CONFIG WARNING] Could not write default config: {e}")
+        return dict(DEFAULT_CONFIG)
+    
+    try:
+        with open(target_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        merged = dict(DEFAULT_CONFIG)
+        merged.update(cfg)
+        return merged
+    except Exception as e:
+        print(f"[CONFIG WARNING] Error loading {target_path}, falling back to defaults: {e}")
+        return dict(DEFAULT_CONFIG)
+
+
+# ============================================================================
+# Self-Learning Adaptive Latency Calibration Engine
+# ============================================================================
+
+class AdaptiveCalibrationEngine:
+    """
+    Continuous velocity-based adaptive latency calibration engine.
+    
+    Dynamically compensates for system & input polling latency:
+        Δθ_lead(ω) = ω * τ_learned
+        
+    Post-Hit Freeze Detection:
+    - Captures the resting needle angle θ_stopped during the post-trigger freeze window (~80-180ms).
+    - Calculates angular error relative to the white patch center:
+        error = θ_stopped - θ_patch_center
+    - Conservatively updates learned latency:
+        Δτ = α * (error / ω)
+      (with learning step α ≈ 0.15-0.25, bounded by max adjustment e.g. 1.5-2.0ms).
+    - Enforces critical safety constraints: τ_learned >= 0, and effective lead point
+      never precedes patch_start by more than a strictly clamped safe margin.
+    - Persists learned latency to config.json and appends diagnostic records to calibration.log.
+    """
+    def __init__(
+        self,
+        config_path: str = "config.json",
+        log_path: Optional[str] = None,
+        speed_calibration: Optional[List[Dict[str, float]]] = None,
+        learning_rate_late: float = 0.20,
+        learning_rate_great: float = 0.15,
+        max_adjustment_ms: float = 2.0,
+        max_micro_adjustment_ms: float = 0.8,
+        max_lead_degrees: float = 90.0,
+        min_latency_ms: float = 0.0,
+        max_latency_ms: float = 300.0,
+        freeze_window_start_s: float = 0.075,
+        freeze_window_end_s: float = 0.180,
+        min_needle_score: float = 35.0,
+        persist_config: bool = True,
+        verbose_logging: bool = False
+    ):
+        resolved_cfg = resolve_config_path(config_path)
+        self.config_path = resolved_cfg
+        if log_path:
+            self.log_path = os.path.abspath(log_path)
+        else:
+            base_dir = os.path.dirname(resolved_cfg)
+            self.log_path = os.path.join(base_dir, "calibration.log")
+
+        if speed_calibration is None:
+            if os.path.exists(resolved_cfg):
+                try:
+                    with open(resolved_cfg, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if "speed_calibration" in data and isinstance(data["speed_calibration"], list):
+                            speed_calibration = data["speed_calibration"]
+                except Exception:
+                    pass
+
+        self.speed_calibration = speed_calibration or [
+            {"speed": 250, "latency_ms": 14.96},
+            {"speed": 350, "latency_ms": 14.96},
+            {"speed": 500, "latency_ms": 14.96},
+            {"speed": 700, "latency_ms": 14.96},
+            {"speed": 1000, "latency_ms": 14.96}
+        ]
+        self.speed_calibration.sort(key=lambda x: x["speed"])
+        self.verbose_logging = verbose_logging
+        self.last_used_anchor = None
+
+        self.learning_rate_late = float(learning_rate_late)
+        self.learning_rate_great = float(learning_rate_great)
+        self.max_adjustment_ms = float(max_adjustment_ms)
+        self.max_micro_adjustment_ms = float(max_micro_adjustment_ms)
+        self.max_lead_degrees = float(max_lead_degrees)
+        self.min_latency_ms = float(min_latency_ms)
+        self.max_latency_ms = float(max_latency_ms)
+        self.freeze_window_start_s = float(freeze_window_start_s)
+        self.freeze_window_end_s = float(freeze_window_end_s)
+        self.min_needle_score = float(min_needle_score)
+        self.persist_config = persist_config
+
+        # Post-trigger tracking state
+        self._is_tracking = False
+        self._trigger_time = 0.0
+        self._trigger_angle = 0.0
+        self._trigger_velocity = 0.0
+        self._patch_start = 0.0
+        self._patch_end = 0.0
+        self._patch_center = 0.0
+        self._patch_span = 0.0
+        self._latency_before = 0.0
+        self._freeze_samples: List[Tuple[float, float, float]] = []
+        self._finalized = False
+        self._is_chained = False
+
+    @property
+    def learned_latency_ms(self) -> float:
+        """Backwards compatible property returning current or nominal learned latency."""
+        if getattr(self, 'last_used_anchor', None):
+            return float(self.last_used_anchor.get("latency_ms", 14.96))
+        if getattr(self, 'speed_calibration', None):
+            return float(self.get_interpolated_latency(300.0))
+        return 14.96
+
+    @learned_latency_ms.setter
+    def learned_latency_ms(self, val: float) -> None:
+        pass
+
+    def get_interpolated_latency(self, velocity: float) -> float:
+        if not self.speed_calibration:
+            return 14.96
+        if velocity <= self.speed_calibration[0]["speed"]:
+            return self.speed_calibration[0]["latency_ms"]
+        if velocity >= self.speed_calibration[-1]["speed"]:
+            return self.speed_calibration[-1]["latency_ms"]
+        
+        for i in range(len(self.speed_calibration) - 1):
+            s1 = self.speed_calibration[i]["speed"]
+            s2 = self.speed_calibration[i+1]["speed"]
+            if s1 <= velocity <= s2:
+                l1 = self.speed_calibration[i]["latency_ms"]
+                l2 = self.speed_calibration[i+1]["latency_ms"]
+                ratio = (velocity - s1) / (s2 - s1)
+                return l1 + ratio * (l2 - l1)
+        return 14.96
+
+    def calculate_dynamic_lead(self, velocity: float) -> float:
+        """
+        Calculate continuous velocity-based dynamic lead angle:
+            Δθ_lead(ω) = ω * (τ_interpolated / 1000.0)
+        Strictly clamped to [0.0, max_lead_degrees].
+        """
+        if velocity <= 0.0:
+            return 0.0
+        interpolated_latency = self.get_interpolated_latency(velocity)
+        if interpolated_latency <= 0.0:
+            return 0.0
+        raw_lead = velocity * (interpolated_latency / 1000.0)
+        return max(0.0, min(self.max_lead_degrees, raw_lead))
+
+    def calculate_angular_error(self, stopped_angle: float, patch_center: float) -> float:
+        """
+        Calculate shortest circular angular error relative to patch center in [-180°, +180°].
+        Positive: needle stopped past center clockwise (late).
+        Negative: needle stopped before center (early).
+        """
+        return ((stopped_angle - patch_center + 180.0) % 360.0) - 180.0
+
+    def classify_hit(self, stopped_angle: float, patch_start: float, patch_end: float, patch_center: float, patch_span: float) -> str:
+        """
+        Classify the landing zone of the stopped needle:
+        - 'GREAT': stopped inside the white success patch.
+        - 'GOOD': stopped past the white patch in the success continuation zone (late).
+        - 'EARLY': stopped before the white patch start (premature trigger).
+        """
+        dist_from_start = (stopped_angle - patch_start) % 360.0
+        if dist_from_start <= patch_span:
+            return "GREAT"
+        if dist_from_start <= 180.0:
+            return "GOOD"
+        return "EARLY"
+
+    def calculate_latency_adjustment(self, error: float, velocity: float, hit_result: str) -> float:
+        """
+        Calculate Δτ (ms) from angular error and needle velocity:
+            Δτ = α * (error / ω) * 1000ms
+        with safety bounding and result-dependent learning rates.
+        """
+        if velocity < 50.0:
+            return 0.0
+
+        raw_delta_ms = (error / velocity) * 1000.0
+
+        if hit_result == "GOOD":
+            # Late hit: increase latency conservatively
+            delta_tau = self.learning_rate_late * raw_delta_ms
+            return max(0.0, min(self.max_adjustment_ms, delta_tau))
+        elif hit_result == "GREAT":
+            # Great hit inside patch: small micro-adjustments toward center
+            if abs(error) <= 0.35:
+                return 0.0
+            delta_tau = self.learning_rate_great * raw_delta_ms
+            return max(-self.max_micro_adjustment_ms, min(self.max_micro_adjustment_ms, delta_tau))
+        elif hit_result == "EARLY":
+            # Early hit: safety back-off immediately
+            delta_tau = self.learning_rate_late * raw_delta_ms
+            return -max(1.0, min(5.0, abs(delta_tau)))
+        return 0.0
+
+    def record_trigger(
+        self,
+        trigger_time: float,
+        trigger_angle: float,
+        angular_velocity: float,
+        patch_start: float,
+        patch_end: float,
+        patch_center: float,
+        patch_span: float,
+        is_chained: bool = False
+    ) -> None:
+        """Register a confirmed trigger event to begin post-hit freeze tracking."""
+        self._is_chained = bool(is_chained)
+        self._is_tracking = True
+        self._trigger_time = trigger_time
+        self._trigger_angle = trigger_angle
+        self._trigger_velocity = angular_velocity
+        self._patch_start = patch_start
+        self._patch_end = patch_end
+        self._patch_center = patch_center
+        self._patch_span = patch_span
+        self._latency_before = self.get_interpolated_latency(angular_velocity)
+        self._freeze_samples = []
+        self._finalized = False
+
+    def on_frame(
+        self,
+        now: float,
+        needle_angle: Optional[float],
+        needle_score: float,
+        qte_present: bool
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Process post-trigger frame. Accumulates freeze samples within the freeze window
+        (~80ms - 180ms) and finalizes calibration when the freeze window elapses.
+        """
+        if not self._is_tracking or self._finalized:
+            return None
+
+        elapsed = now - self._trigger_time
+
+        # Accumulate needle samples during freeze window
+        if self.freeze_window_start_s <= elapsed <= self.freeze_window_end_s:
+            if qte_present and needle_angle is not None and needle_score >= self.min_needle_score:
+                self._freeze_samples.append((elapsed, needle_angle, needle_score))
+
+        # Check for window completion: either window expired, or QTE vanished after gathering samples
+        if elapsed > self.freeze_window_end_s or (elapsed >= self.freeze_window_start_s and not qte_present and len(self._freeze_samples) >= 1):
+            return self.finalize_calibration(qte_vanished=(not qte_present))
+
+        # Safety timeout if QTE hangs
+        if elapsed > 0.350:
+            self._is_tracking = False
+            self._finalized = True
+
+        return None
+
+    def finalize_calibration(self, qte_vanished: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Process collected freeze samples, estimate resting angle θ_stopped,
+        compute error relative to patch center, adjust τ_learned, log diagnostic entry,
+        and persist updated calibration.
+        """
+        if not self._is_tracking or self._finalized:
+            return None
+        self._is_tracking = False
+        self._finalized = True
+
+        if len(self._freeze_samples) < 1:
+            return None
+
+        if len(self._freeze_samples) == 1:
+            if not qte_vanished:
+                # If freeze window elapsed while QTE was still on screen, a single sample cannot prove stillness (< 2.0° drift)
+                return None
+            stopped_angle = self._freeze_samples[0][1]
+        else:
+            # Unwrap angles relative to first sample to compute circular median/mean
+            angles = [s[1] for s in self._freeze_samples]
+            ref = angles[0]
+            unwrapped = [ref + (((a - ref + 180.0) % 360.0) - 180.0) for a in angles]
+
+            # Verify needle stillness during freeze window:
+            # The collected freeze samples must have angular variance/drift < 2.0° (proving the needle actually stopped).
+            # If the needle is still moving (>= 2.0° movement), discard the hit from calibration.
+            drift = max(unwrapped) - min(unwrapped)
+            mean_val = sum(unwrapped) / len(unwrapped)
+            var_val = sum((a - mean_val) ** 2 for a in unwrapped) / len(unwrapped)
+            if drift >= 2.0 or var_val >= 2.0:
+                return None
+
+            median_val = sorted(unwrapped)[len(unwrapped) // 2]
+            # Discard any outlier samples (e.g. from UI transition)
+            stable = [a for a in unwrapped if abs(a - median_val) <= 2.5]
+            if not stable:
+                stable = unwrapped
+            stopped_angle = (sum(stable) / len(stable)) % 360.0
+
+        return self.update_learned_latency(
+            stopped_angle=stopped_angle,
+            trigger_angle=self._trigger_angle,
+            angular_velocity=self._trigger_velocity,
+            patch_start=self._patch_start,
+            patch_end=self._patch_end,
+            patch_center=self._patch_center,
+            patch_span=self._patch_span,
+            is_chained=self._is_chained
+        )
+
+    def update_learned_latency(
+        self,
+        stopped_angle: float,
+        trigger_angle: float,
+        angular_velocity: float,
+        patch_start: float,
+        patch_end: float,
+        patch_center: float,
+        patch_span: float,
+        log_entry: bool = True,
+        is_chained: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Calculate error, update learned latency parameter, persist to config, and write to log.
+        """
+        error = self.calculate_angular_error(stopped_angle, patch_center)
+        if abs(error) > 20.0:
+            # Outlier rejection: a real hit error is never > 20°; reject sweeping needle transition
+            return None
+
+        result = self.classify_hit(stopped_angle, patch_start, patch_end, patch_center, patch_span)
+        delta_tau = self.calculate_latency_adjustment(error, angular_velocity, result)
+
+        if not self.speed_calibration:
+            self.speed_calibration.append({"speed": angular_velocity, "latency_ms": 14.96})
+
+        # Find nearest anchor
+        nearest_idx = 0
+        min_diff = float('inf')
+        for i, anchor in enumerate(self.speed_calibration):
+            diff = abs(anchor["speed"] - angular_velocity)
+            if diff < min_diff:
+                min_diff = diff
+                nearest_idx = i
+
+        if min_diff > 50:
+            new_anchor = {"speed": angular_velocity, "latency_ms": self.get_interpolated_latency(angular_velocity)}
+            self.speed_calibration.append(new_anchor)
+            self.speed_calibration.sort(key=lambda x: x["speed"])
+            nearest_idx = self.speed_calibration.index(new_anchor)
+
+        anchor = self.speed_calibration[nearest_idx]
+        lat_before = anchor["latency_ms"]
+
+        lat_after = max(self.min_latency_ms, min(self.max_latency_ms, lat_before + delta_tau))
+        
+        # Soft cap proportional to speed
+        max_allowed_lead = patch_span / 2.0
+        max_allowed_lat = (max_allowed_lead * 1000.0) / max(1.0, anchor["speed"])
+
+        if lat_after > max_allowed_lat:
+            lat_after = max_allowed_lat
+
+        lat_after = round(lat_after, 2)
+        anchor["latency_ms"] = lat_after
+        self.last_used_anchor = anchor
+
+        if self.persist_config:
+            update_persisted_config({"speed_calibration": self.speed_calibration}, self.config_path)
+
+        if log_entry:
+            self.log_calibration_entry(
+                w=angular_velocity,
+                trig=trigger_angle,
+                stop=stopped_angle,
+                p_start=patch_start,
+                p_end=patch_end,
+                p_center=patch_center,
+                err=error,
+                lat_before=lat_before,
+                lat_after=lat_after,
+                result=result,
+                is_chained=is_chained
+            )
+
+        return {
+            'stopped_angle': stopped_angle,
+            'patch_center': patch_center,
+            'error': error,
+            'result': result,
+            'delta_tau': delta_tau,
+            'latency_before': lat_before,
+            'latency_after': lat_after,
+            'anchor_speed': anchor["speed"]
+        }
+
+    def log_calibration_entry(
+        self,
+        w: float,
+        trig: float,
+        stop: float,
+        p_start: float,
+        p_end: float,
+        p_center: float,
+        err: float,
+        lat_before: float,
+        lat_after: float,
+        result: str,
+        is_chained: bool = False
+    ) -> None:
+        """
+        Append clean, detailed diagnostic entry to calibration.log.
+        """
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        anchor_speed = self.last_used_anchor["speed"] if self.last_used_anchor else w
+        lead_angle = w * (lat_before / 1000.0)
+        chained_str = "yes" if is_chained else "no"
+        entry = (
+            f"[{now_str}] HIT | Speed: {w:.1f}°/s | Triggered: {trig:.1f}° | Stopped: {stop:.1f}° | "
+            f"Patch: [{p_start:.1f}°..{p_end:.1f}°] (Center: {p_center:.1f}°) | "
+            f"Error: {err:+.1f}° | Latency: {lat_before:.1f}ms -> {lat_after:.1f}ms | "
+            f"Lead: {lead_angle:.1f}° | Anchor: {anchor_speed:.0f}°/s @ {lat_after:.1f}ms | "
+            f"Chained: {chained_str} | Result: {result}\n"
+        )
+        try:
+            log_dir = os.path.dirname(self.log_path)
+            if log_dir and not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(entry)
+        except Exception:
+            pass
+
+
+# ============================================================================
 # QTE Detection & Geometry Lookup Tables (LUT)
 # ============================================================================
 
@@ -425,7 +939,21 @@ class QTEDetector:
     """
     MIN_NEEDLE_SCORE = 35.0
 
-    def __init__(self, crop_size: int = 300, hit_position: str = "center", offset_degrees: float = 0.0, lead_degrees: float = 0.0, latency_ms: float = 0.0, min_needle_score: float = 35.0):
+    def __init__(
+        self,
+        crop_size: int = 320,
+        hit_position: str = "start",
+        offset_degrees: float = 0.0,
+        lead_degrees: float = 0.0,
+        latency_ms: float = 0.0,
+        min_needle_score: float = 35.0,
+        trigger_delay_ms: float = 0.0,
+        learned_latency_ms: Optional[float] = None,
+        config_path: str = "config.json",
+        calibration_engine: Optional[AdaptiveCalibrationEngine] = None,
+        enable_adaptive_calibration: bool = True,
+        verbose_logging: bool = False
+    ):
         self.crop_size = crop_size
         self.cx = crop_size // 2
         self.cy = crop_size // 2
@@ -434,6 +962,21 @@ class QTEDetector:
         self.lead_degrees = lead_degrees
         self.latency_ms = latency_ms
         self.min_needle_score = float(min_needle_score)
+        self.trigger_delay_ms = float(trigger_delay_ms)
+        self.base_delay_s = self.trigger_delay_ms / 1000.0
+        self.config_path = config_path
+        self.verbose_logging = verbose_logging
+
+        # Setup adaptive calibration engine
+        if calibration_engine is not None:
+            self.calibration_engine = calibration_engine
+        elif enable_adaptive_calibration:
+            self.calibration_engine = AdaptiveCalibrationEngine(
+                config_path=config_path,
+                min_needle_score=self.min_needle_score
+            )
+        else:
+            self.calibration_engine = None
         
         # State tracking for the current active QTE
         self.is_qte_active = False
@@ -454,10 +997,14 @@ class QTEDetector:
         self.qte_start_time = 0.0
         self.qte_frames = 0
         self.absent_frames = 0
+        self.chain_hit_count: int = 0
+        self._reset_velocity_on_next_sample: bool = False
         self._current_frame_buf: Optional[Any] = None
         self._current_frame_glyph: Optional[Tuple[bool, int, int, int, int]] = None
         self._presence_geom: Optional[Tuple[int, int, int]] = None
         self._last_ring_center: Optional[Tuple[int, int, int]] = None
+        self._last_rearm_scan_time: float = 0.0
+        self._cached_rearm_patch: Optional[Tuple[float, float, float, float]] = None
 
     def _get_buffer_dims(self, buf, width: Optional[int] = None, height: Optional[int] = None) -> Tuple[int, int]:
         """Dynamically detect buffer dimensions from buffer length and parameters."""
@@ -495,6 +1042,8 @@ class QTEDetector:
         self.has_triggered_current_qte = False
         self.last_trigger_time = 0.0
         self.triggered_patch_center = None
+        self.chain_hit_count = 0
+        self._reset_velocity_on_next_sample = False
         self.qte_start_time = 0.0
         self.qte_frames = 0
         self.absent_frames = 0
@@ -502,12 +1051,59 @@ class QTEDetector:
         self._current_frame_glyph = None
         self._presence_geom = None
         self._last_ring_center = None
+        self._last_rearm_scan_time = 0.0
+        self._cached_rearm_patch = None
+        if getattr(self, 'calibration_engine', None) is not None and self.calibration_engine._is_tracking:
+            self.calibration_engine.on_frame(time.perf_counter(), None, 0.0, False)
+            self.calibration_engine._is_tracking = False
+            self.calibration_engine._finalized = True
+
+    def record_trigger(
+        self,
+        trigger_time: Optional[float] = None,
+        trigger_angle: Optional[float] = None,
+        angular_velocity: Optional[float] = None,
+        patch_start: Optional[float] = None,
+        patch_end: Optional[float] = None,
+        patch_center: Optional[float] = None,
+        patch_span: Optional[float] = None,
+        is_chained: Optional[bool] = None
+    ) -> None:
+        """Forward confirmed trigger event to the adaptive calibration engine."""
+        if getattr(self, 'calibration_engine', None) is not None:
+            t = trigger_time if trigger_time is not None else time.perf_counter()
+            ang = trigger_angle if trigger_angle is not None else (self.prev_needle_angle or 0.0)
+            vel = angular_velocity if angular_velocity is not None else self.angular_velocity
+            ps = patch_start if patch_start is not None else (self.cached_patch_start or 0.0)
+            pe = patch_end if patch_end is not None else (self.cached_patch_end or 0.0)
+            pc = patch_center if patch_center is not None else (self.cached_patch_center or 0.0)
+            span = patch_span if patch_span is not None else (self.cached_patch_span or 0.0)
+            if is_chained is None:
+                # If chain_hit_count > 1 (incremented on trigger), this hit was chained
+                is_chained = (self.chain_hit_count > 1)
+            self.calibration_engine.record_trigger(
+                trigger_time=t,
+                trigger_angle=ang,
+                angular_velocity=vel,
+                patch_start=ps,
+                patch_end=pe,
+                patch_center=pc,
+                patch_span=span,
+                is_chained=is_chained
+            )
 
     def revert_trigger(self) -> None:
         """Revert trigger state if keyboard controller was unable to dispatch the keystroke."""
         self.has_triggered_current_qte = False
         self.last_trigger_time = 0.0
         self.triggered_patch_center = None
+        self._last_rearm_scan_time = 0.0
+        self._cached_rearm_patch = None
+        if self.chain_hit_count > 0:
+            self.chain_hit_count -= 1
+        if getattr(self, 'calibration_engine', None) is not None:
+            self.calibration_engine._is_tracking = False
+            self.calibration_engine._finalized = True
 
     def find_glyph_and_geometry(self, buf, width: Optional[int] = None, height: Optional[int] = None) -> Tuple[bool, int, int, int, int]:
         """
@@ -516,20 +1112,23 @@ class QTEDetector:
         Returns: (found: bool, cx: int, cy: int, R: int, bar_len: int)
         """
         w, h = self._get_buffer_dims(buf, width, height)
+        nom_cx, nom_cy = w // 2, h // 2
+
+        if buf is None or len(buf) < w * h * 4:
+            return (False, nom_cx, nom_cy, 83, 0)
 
         if getattr(self, '_current_frame_buf', None) is buf and getattr(self, '_current_frame_glyph', None) is not None:
             return self._current_frame_glyph
 
-        nom_cx, nom_cy = w // 2, h // 2
         candidates = []
 
-        # Scan rows with step=2 for efficiency across vertical offset window (covers +/- 50 shift)
-        for y in range(max(10, nom_cy - 60), min(h - 10, nom_cy + 65), 2):
+        # Scan rows with step=2 for efficiency across center area (covers offset and centering variance)
+        for y in range(max(10, nom_cy - 65), min(h - 10, nom_cy + 75), 2):
             row_off = y * w * 4
             in_run = False
             run_start = 0
             runs = []
-            for x in range(max(10, nom_cx - 60), min(w - 10, nom_cx + 61)):
+            for x in range(max(10, nom_cx - 65), min(w - 10, nom_cx + 66)):
                 off = row_off + x * 4
                 b, g, r = buf[off], buf[off + 1], buf[off + 2]
                 lum = (int(r) + int(g) + int(b)) / 3.0
@@ -549,10 +1148,10 @@ class QTEDetector:
                 runs.append((run_start, run_len))
 
             for r_start, r_len in runs:
-                if 30 <= r_len <= 75:
+                if 20 <= r_len <= 90:
                     bar_cx = r_start + r_len // 2
-                    # Tighten scanning around center: tolerance <= 28px
-                    if abs(bar_cx - nom_cx) > 28:
+                    # Tighten scanning around center: tolerance <= 35px
+                    if abs(bar_cx - nom_cx) > 35:
                         continue
                     left_edge = r_start
                     right_edge = r_start + r_len - 1
@@ -607,7 +1206,7 @@ class QTEDetector:
         est_cx = top_cand[2]
         r_len = top_cand[3]
         est_cy = top_y - int(round(r_len * 0.05))
-        est_r = int(round(r_len * 1.48))
+        est_r = max(50, min(120, int(round(r_len * 1.48))))
         res = (True, est_cx, est_cy, est_r, r_len)
         self._current_frame_buf = buf
         self._current_frame_glyph = res
@@ -621,49 +1220,73 @@ class QTEDetector:
         Searches +/- 6px vertical offsets (dy in [0, -6, 6]) to accommodate UI center variance.
         """
         w, h = self._get_buffer_dims(buf, width)
+        if buf is None or len(buf) < w * h * 4:
+            return False
         if cx is None: cx = w // 2
         if cy is None: cy = h // 2
         if R is None: R = self.cached_r if self.is_qte_active else 83
 
-        best_contrast = -999.0
-        best_in_dark = 0.0
-        best_avg_ring = 0.0
-        best_ccy = cy
+        r_in = int(round(R * 0.82))
 
-        for dy in [0, -6, 6]:
-            ccy = cy + dy
-            r_in = int(round(R * 0.82))
+        def _sample_ring_at(ccy: int) -> Tuple[float, float, float]:
             dark_in = 0
-            lum_ring_sum = 0
-            lum_in_sum = 0
+            lum_ring_sum = 0.0
+            lum_in_sum = 0.0
             total = 0
-            for deg in range(0, 360, 10):
-                rad = math.radians(deg)
-                cos_a, sin_a = math.cos(rad), math.sin(rad)
+            for cos_a, sin_a in _TRIG_RING:
                 px_in = int(round(cx + r_in * cos_a))
                 py_in = int(round(ccy + r_in * sin_a))
-                px = int(round(cx + R * cos_a))
-                py = int(round(ccy + R * sin_a))
-                if 0 <= px_in < w and 0 <= py_in < h and 0 <= px < w and 0 <= py < h:
+                best_l = 0.0
+                for dr in (-2, -1, 0, 1, 2):
+                    px = int(round(cx + (R + dr) * cos_a))
+                    py = int(round(ccy + (R + dr) * sin_a))
+                    if 0 <= px < w and 0 <= py < h:
+                        off = (py * w + px) * 4
+                        l_val = (buf[off] + buf[off + 1] + buf[off + 2]) / 3.0
+                        if l_val > best_l:
+                            best_l = l_val
+                if 0 <= px_in < w and 0 <= py_in < h:
                     off_in = (py_in * w + px_in) * 4
-                    off = (py * w + px) * 4
                     lin = (buf[off_in] + buf[off_in + 1] + buf[off_in + 2]) / 3.0
-                    l = (buf[off] + buf[off + 1] + buf[off + 2]) / 3.0
                     if lin < 80:
                         dark_in += 1
                     lum_in_sum += lin
-                    lum_ring_sum += l
+                    lum_ring_sum += best_l
                     total += 1
-
             if total >= 10:
                 in_dark = dark_in / total
                 avg_ring = lum_ring_sum / total
                 contrast = avg_ring - (lum_in_sum / total)
-                if contrast > best_contrast:
-                    best_contrast = contrast
-                    best_in_dark = in_dark
-                    best_avg_ring = avg_ring
-                    best_ccy = ccy
+                return in_dark, avg_ring, contrast
+            return 0.0, 0.0, -999.0
+
+        # Fast-path: Check nominal offset dy=0 first
+        in_dark0, avg_ring0, contrast0 = _sample_ring_at(cy)
+        if in_dark0 >= 0.65 and avg_ring0 >= 90.0 and contrast0 >= 30.0:
+            self._last_ring_center = (cx, cy, R)
+            return True
+
+        # If nominal offset has virtually no ring brightness or contrast, early exit
+        if contrast0 < 10.0 or avg_ring0 < 50.0:
+            self._last_ring_center = (cx, cy, R)
+            return False
+
+        best_contrast = contrast0
+        best_in_dark = in_dark0
+        best_avg_ring = avg_ring0
+        best_ccy = cy
+
+        for dy in [-6, 6, -12, 12, -20, 20, -36, 36]:
+            ccy = cy + dy
+            in_d, avg_r, cont = _sample_ring_at(ccy)
+            if cont > best_contrast:
+                best_contrast = cont
+                best_in_dark = in_d
+                best_avg_ring = avg_r
+                best_ccy = ccy
+                if best_in_dark >= 0.65 and best_avg_ring >= 90.0 and best_contrast >= 30.0:
+                    self._last_ring_center = (cx, best_ccy, R)
+                    return True
 
         self._last_ring_center = (cx, best_ccy, R)
         return best_in_dark >= 0.65 and best_avg_ring >= 90.0 and best_contrast >= 30.0
@@ -677,6 +1300,9 @@ class QTEDetector:
         2. Real red needle with high red dominance (needle_score >= 35.0)
         3. Valid white patch on that ring.
         """
+        if buf is None or len(buf) < 16:
+            return False
+
         # If QTE is currently active, maintain state via hysteresis
         if self.is_qte_active:
             g_found, _, _, _, _ = self.find_glyph_and_geometry(buf)
@@ -712,21 +1338,37 @@ class QTEDetector:
         # Pathway 2: Dark circular ring boundary fallback (when center glyph is occluded)
         w, h = self._get_buffer_dims(buf)
         nom_cx, nom_cy = w // 2, h // 2
-        for r_cand in (83, 67, 95):
-            if self.check_ring_boundary(buf, nom_cx, nom_cy, r_cand):
-                rcx, rcy, rr = getattr(self, '_last_ring_center', (nom_cx, nom_cy, r_cand))
+        # Fast-path: Test nominal radius (R=83) first
+        if self.check_ring_boundary(buf, nom_cx, nom_cy, 83):
+            rcx, rcy, rr = getattr(self, '_last_ring_center', (nom_cx, nom_cy, 83))
+            try:
+                _, n_score = self.detect_needle(buf, rcx, rcy, rr)
+            except TypeError:
+                _, n_score = self.detect_needle(buf, rcx, rcy, rr)
+            if n_score >= self.min_needle_score:
                 try:
-                    _, n_score = self.detect_needle(buf, rcx, rcy, rr)
+                    patch = self.detect_white_patch(buf, rcx, rcy, rr)
                 except TypeError:
-                    _, n_score = self.detect_needle(buf, rcx, rcy, rr)
-                if n_score >= self.min_needle_score:
+                    patch = self.detect_white_patch(buf, rcx, rcy, rr)
+                if patch is not None:
+                    self._presence_geom = (rcx, rcy, rr)
+                    return True
+        else:
+            for r_cand in (67, 95, 75, 60, 90, 100, 105, 110):
+                if self.check_ring_boundary(buf, nom_cx, nom_cy, r_cand):
+                    rcx, rcy, rr = getattr(self, '_last_ring_center', (nom_cx, nom_cy, r_cand))
                     try:
-                        patch = self.detect_white_patch(buf, rcx, rcy, rr)
+                        _, n_score = self.detect_needle(buf, rcx, rcy, rr)
                     except TypeError:
-                        patch = self.detect_white_patch(buf, rcx, rcy, rr)
-                    if patch is not None:
-                        self._presence_geom = (rcx, rcy, rr)
-                        return True
+                        _, n_score = self.detect_needle(buf, rcx, rcy, rr)
+                    if n_score >= self.min_needle_score:
+                        try:
+                            patch = self.detect_white_patch(buf, rcx, rcy, rr)
+                        except TypeError:
+                            patch = self.detect_white_patch(buf, rcx, rcy, rr)
+                        if patch is not None:
+                            self._presence_geom = (rcx, rcy, rr)
+                            return True
 
         return False
 
@@ -737,6 +1379,8 @@ class QTEDetector:
         Returns: (needle_angle_deg, peak_red_contrast)
         """
         w, h = self._get_buffer_dims(buf, width)
+        if buf is None or len(buf) < w * h * 4:
+            return (0.0, 0.0)
         nom_cx, nom_cy = w // 2, h // 2
         if cx is None or cy is None or R is None:
             if self.is_qte_active:
@@ -753,9 +1397,7 @@ class QTEDetector:
         max_red = -999.0
         scores = []
         max_r_vals = []
-        for deg in range(360):
-            rad = math.radians(deg)
-            cos_a, sin_a = math.cos(rad), math.sin(rad)
+        for deg, (cos_a, sin_a) in enumerate(_TRIG_360):
             red_sum = 0
             valid_samples = 0
             max_r_along_ray = 0
@@ -806,6 +1448,8 @@ class QTEDetector:
         Returns: (start_deg, end_deg, center_deg, span_deg) or None
         """
         w, h = self._get_buffer_dims(buf, width)
+        if buf is None or len(buf) < w * h * 4:
+            return None
         nom_cx, nom_cy = w // 2, h // 2
         if cx is None or cy is None or R is None:
             if self.is_qte_active:
@@ -817,15 +1461,15 @@ class QTEDetector:
                 cx = g_cx if found else (nom_cx if cx is None else cx)
                 cy = g_cy if found else (nom_cy if cy is None else cy)
                 R = g_r if found else (83 if R is None else R)
-        patch_angles = [i * 0.5 for i in range(720)]
         bright_angles = []
-        dr_list = [-2, -1, 0, 1, 2]
+        angle_lums = {}
+        dr_list = [-3, -2, -1, 0, 1, 2, 3]
 
-        for a in patch_angles:
-            rad = math.radians(a)
-            cos_a, sin_a = math.cos(rad), math.sin(rad)
+        for i, (cos_a, sin_a) in enumerate(_TRIG_720):
+            a = i * 0.5
             cnt = 0
             valid = 0
+            lum_sum = 0.0
             for dr in dr_list:
                 r_curr = R + dr
                 px = int(round(cx + r_curr * cos_a))
@@ -834,10 +1478,12 @@ class QTEDetector:
                     valid += 1
                     off = (py * w + px) * 4
                     lum = (int(buf[off + 2]) + int(buf[off + 1]) + int(buf[off])) / 3.0
+                    lum_sum += lum
                     if (buf[off + 2] > 170 and buf[off + 1] > 120 and lum > 150) or (buf[off + 2] > 180 and lum > 135):
                         cnt += 1
-            if (valid >= 5 and cnt >= 4) or (valid == 4 and cnt >= 3) or (valid in (2, 3) and cnt >= 2) or (valid == 1 and cnt >= 1):
+            if (valid >= 6 and cnt >= 4) or (valid == 5 and cnt >= 4) or (valid in (3, 4) and cnt >= 2) or (valid in (1, 2) and cnt >= 1):
                 bright_angles.append(a)
+                angle_lums[a] = lum_sum / valid if valid > 0 else 0.0
 
         if not bright_angles:
             return None
@@ -866,83 +1512,90 @@ class QTEDetector:
             span = (end - start) % 360.0
             if 5.0 <= span <= 18.0:
                 center = (start + span / 2.0) % 360.0
-                rad_before = math.radians((start - 6.0) % 360.0)
-                rad_after = math.radians((end + 6.0) % 360.0)
-                lum_b_min = 999.0
-                lum_a_min = 999.0
-                has_b = False
-                has_a = False
-                for b_dr in [-2, -1, 0, 1, 2]:
-                    px_b = int(round(cx + (R + b_dr) * math.cos(rad_before)))
-                    py_b = int(round(cy + (R + b_dr) * math.sin(rad_before)))
-                    if 0 <= px_b < w and 0 <= py_b < h:
-                        off_b = (py_b * w + px_b) * 4
-                        b_lum = (int(buf[off_b]) + int(buf[off_b + 1]) + int(buf[off_b + 2])) / 3.0
-                        if b_lum < lum_b_min:
-                            lum_b_min = b_lum
-                        has_b = True
-
-                    px_a = int(round(cx + (R + b_dr) * math.cos(rad_after)))
-                    py_a = int(round(cy + (R + b_dr) * math.sin(rad_after)))
-                    if 0 <= px_a < w and 0 <= py_a < h:
-                        off_a = (py_a * w + px_a) * 4
-                        a_lum = (int(buf[off_a]) + int(buf[off_a + 1]) + int(buf[off_a + 2])) / 3.0
-                        if a_lum < lum_a_min:
-                            lum_a_min = a_lum
-                        has_a = True
-
-                borders_dark = (has_b and lum_b_min < 95) or (has_a and lum_a_min < 95) or (not has_b and not has_a)
-
-                if not borders_dark:
-                    continue
-                candidates.append((borders_dark, len(r), start, end, center, span))
+                avg_lum = sum(angle_lums[a] for a in r) / len(r) if r else 0.0
+                candidates.append((avg_lum, len(r), start, end, center, span))
 
         if not candidates:
             return None
 
-        # Prioritize candidates bordering the dark arc, then highest sample count
+        # Prioritize candidates by highest brightness, then longest sample run / span length
         candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
         best = candidates[0]
         return (best[2], best[3], best[4], best[5])
 
     def calculate_target_angle(self, patch_start: float, patch_end: float, patch_center: float, patch_span: float, lead_degrees: Optional[float] = None) -> float:
-        """Calculate desired trigger angle based on config hit_position, offset, and lead compensation."""
-        hp = self.hit_position
+        """Calculate desired trigger angle based on config offset, and lead compensation with safety clamp."""
         lead = lead_degrees if lead_degrees is not None else getattr(self, 'lead_degrees', 0.0)
 
-        if hp == "start":
+        # Target patch center minus lead
+        target = (patch_center - lead) % 360.0
+        target = (target + self.offset_degrees) % 360.0
+
+        # Safety clamp: never before patch_start
+        dist = (target - patch_start) % 360.0
+        if dist > patch_span:
             target = patch_start
-        elif hp == "lead":
-            # Early trigger leading the patch start (default 2.0° lead or configured lead)
-            lead_val = lead if lead > 0.0 else 2.0
-            target = (patch_start - lead_val) % 360.0
-        elif hp == "early":
-            target = (patch_start + patch_span * 0.25) % 360.0
-        elif hp == "late":
-            target = (patch_start + patch_span * 0.75) % 360.0
-        elif hp == "end":
-            target = patch_end
-        else:  # default "center"
-            target = patch_center
 
-        if hp != "lead" and lead > 0.0:
-            target = (target - lead) % 360.0
+        return target
 
-        return (target + self.offset_degrees) % 360.0
+    def calculate_effective_delay(self, base_delay_s: Optional[float] = None, needle_angle: Optional[float] = None) -> float:
+        """
+        Calculate velocity-compensated trigger delay.
+        When hit_position == 'start', clamps the effective delay so that delay_s * omega does not
+        exceed ~60-70% of the patch span, preventing overshooting on fast needle rotations
+        while ensuring the needle NEVER triggers early before patch start and slower spins
+        still get the full base delay. If the needle crossed the patch into the late success zone,
+        returns 0.0 delay to trigger immediately.
+        """
+        delay_s = base_delay_s if base_delay_s is not None else getattr(self, 'base_delay_s', 0.0)
+        if delay_s <= 0.0:
+            return 0.0
+        if self.cached_patch_start is None or self.cached_patch_span is None:
+            return delay_s
 
-    def evaluate(self, buf) -> Dict[str, Any]:
+        p_start = self.cached_patch_start
+        p_span = self.cached_patch_span
+        n_angle = needle_angle if needle_angle is not None else self.prev_needle_angle
+        if n_angle is None:
+            return delay_s
+
+        dist_from_start = (n_angle - p_start) % 360.0
+        if dist_from_start > 180.0:
+            # Needle is before patch start (should not happen on trigger, but guard)
+            return delay_s
+
+        # If needle is already at or past the white patch end, trigger immediately with 0 delay (late hit)
+        if dist_from_start >= p_span:
+            return 0.0
+
+        remaining_budget = max(0.0, p_span - dist_from_start)
+
+        omega = self.angular_velocity
+        if omega <= 50.0:
+            # Velocity is low or unknown: if needle is already in the back third of the patch,
+            # scale down delay so it doesn't overshoot
+            if dist_from_start > 0.65 * p_span:
+                scale = max(0.0, (p_span - dist_from_start) / (0.35 * p_span))
+                return delay_s * scale
+            return delay_s
+
+        # High angular velocity:
+        # We want the needle during the delay to advance by at most ~65% of patch span,
+        # and not past 80% of the remaining budget to avoid overshooting the white patch.
+        # Slower spins (e.g. 300°/s) where delay_s * omega lands inside the budget retain full delay.
+        max_spin_advance = 0.65 * p_span
+        max_budget_advance = remaining_budget * 0.80
+        allowed_advance = min(max_spin_advance, max_budget_advance)
+
+        max_delay_s = allowed_advance / omega
+        return max(0.0, min(delay_s, max_delay_s))
+
+    def evaluate(self, buf, now: Optional[float] = None) -> Dict[str, Any]:
         """
         Evaluate full frame state.
         Returns a dictionary with detection telemetry and trigger decision.
         """
-        if getattr(self, '_current_frame_buf', None) is not buf:
-            self._current_frame_buf = None
-            self._current_frame_glyph = None
-        buf_w, buf_h = self._get_buffer_dims(buf)
-        found = self.check_presence(buf)
-        now = time.perf_counter()
-
-        if not found and not self.is_qte_active:
+        if buf is None or len(buf) < 16:
             self._current_frame_buf = None
             self._current_frame_glyph = None
             return {
@@ -956,8 +1609,41 @@ class QTEDetector:
                 'target_angle': None,
                 'angular_velocity': 0.0,
                 'dynamic_lead': 0.0,
+                'effective_delay_s': 0.0,
                 'should_trigger': False,
-                'reason': 'No QTE on screen'
+                'reason': 'Empty buffer',
+                'is_chained': False,
+                'chain_hit_count': 0
+            }
+
+        if getattr(self, '_current_frame_buf', None) is not buf:
+            self._current_frame_buf = None
+            self._current_frame_glyph = None
+        buf_w, buf_h = self._get_buffer_dims(buf)
+        found = self.check_presence(buf)
+        now = time.perf_counter() if now is None else float(now)
+
+        if not found and not self.is_qte_active:
+            if getattr(self, 'calibration_engine', None) is not None and self.calibration_engine._is_tracking:
+                self.calibration_engine.on_frame(now, None, 0.0, False)
+            self._current_frame_buf = None
+            self._current_frame_glyph = None
+            return {
+                'present': False,
+                'needle_angle': None,
+                'needle_score': 0.0,
+                'patch_start': None,
+                'patch_end': None,
+                'patch_center': None,
+                'patch_span': None,
+                'target_angle': None,
+                'angular_velocity': 0.0,
+                'dynamic_lead': 0.0,
+                'effective_delay_s': 0.0,
+                'should_trigger': False,
+                'reason': 'No QTE on screen',
+                'is_chained': False,
+                'chain_hit_count': 0
             }
 
         if found:
@@ -976,8 +1662,11 @@ class QTEDetector:
                 self.has_triggered_current_qte = False
                 self.last_trigger_time = 0.0
                 self.triggered_patch_center = None
+                self.chain_hit_count = 0
         else:
             self.absent_frames += 1
+            if getattr(self, 'calibration_engine', None) is not None and self.calibration_engine._is_tracking:
+                self.calibration_engine.on_frame(now, None, 0.0, False)
             if self.absent_frames >= 3:
                 self.reset()
                 return {
@@ -991,8 +1680,11 @@ class QTEDetector:
                     'target_angle': None,
                     'angular_velocity': 0.0,
                     'dynamic_lead': 0.0,
+                    'effective_delay_s': 0.0,
                     'should_trigger': False,
-                    'reason': 'QTE disappeared'
+                    'reason': 'QTE disappeared',
+                    'is_chained': False,
+                    'chain_hit_count': 0
                 }
             return {
                 'present': False,
@@ -1005,8 +1697,11 @@ class QTEDetector:
                 'target_angle': self.cached_target_angle,
                 'angular_velocity': self.angular_velocity,
                 'dynamic_lead': 0.0,
+                'effective_delay_s': 0.0,
                 'should_trigger': False,
-                'reason': 'QTE dropped frame / noise'
+                'reason': 'QTE dropped frame / noise',
+                'is_chained': (self.chain_hit_count > 0),
+                'chain_hit_count': self.chain_hit_count
             }
 
         self.qte_frames += 1
@@ -1027,23 +1722,43 @@ class QTEDetector:
         if has_real_needle and self.prev_needle_angle is not None and self.prev_needle_time is not None:
             dt = now - self.prev_needle_time
             d_theta = (needle_angle - self.prev_needle_angle) % 360.0
-            if 0.35 <= d_theta <= 120.0:
+            if 0.35 <= d_theta <= 180.0:
                 if 0.0045 <= dt <= 0.25:
                     raw_velocity = d_theta / dt
-                    if 50.0 <= raw_velocity <= 1500.0:
-                        if self.angular_velocity == 0.0:
+                    if raw_velocity >= 50.0:
+                        if (
+                            self.angular_velocity == 0.0
+                            or getattr(self, '_reset_velocity_on_next_sample', False)
+                            or raw_velocity < 0.5 * self.angular_velocity
+                            or raw_velocity > 1.8 * self.angular_velocity
+                        ):
+                            # Instant speedometer adaptation on sudden slowdown, speedup, new patch, or start
                             self.angular_velocity = raw_velocity
+                            self._reset_velocity_on_next_sample = False
                         else:
                             # Smooth with Exponential Moving Average (EMA)
                             self.angular_velocity = 0.35 * raw_velocity + 0.65 * self.angular_velocity
             elif dt > 0.5:
                 self.angular_velocity = 0.0
+                self._reset_velocity_on_next_sample = True
 
         # Velocity-based dynamic lead compensation:
-        # dynamic_lead = (velocity * (latency_ms / 1000.0)) + lead_degrees
-        velocity_lead = (self.angular_velocity * (self.latency_ms / 1000.0)) if self.angular_velocity > 0.0 else 0.0
-        clamped_velocity_lead = max(0.0, min(30.0, velocity_lead))
-        dynamic_lead = self.lead_degrees + clamped_velocity_lead
+        # If adaptive calibration engine is present, calculate continuous velocity lead:
+        # Δθ_lead(ω) = ω * τ_learned (strictly clamped by safe margin)
+        cal_lead = 0.0
+        if getattr(self, 'calibration_engine', None) is not None:
+            cal_lead = self.calibration_engine.calculate_dynamic_lead(self.angular_velocity)
+
+        manual_lead = (self.angular_velocity * (self.latency_ms / 1000.0)) if self.latency_ms > 0.0 and self.angular_velocity > 0.0 else 0.0
+        clamped_manual_lead = max(0.0, min(30.0, manual_lead))
+
+        if self.hit_position == "start":
+            # In 'start' hit position, only use calibrated velocity lead; strictly clamp for 0% early tolerance
+            dynamic_lead = cal_lead
+        else:
+            dynamic_lead = self.lead_degrees + cal_lead + clamped_manual_lead
+
+
 
         # Continuous Skill Check Re-arming:
         # If the macro has already triggered the current check, monitor for patch change or exit
@@ -1056,13 +1771,19 @@ class QTEDetector:
 
             # Re-arm check: after 40ms minimum key hold duration, check for new patch or patch exit
             if time_since_trigger >= 0.040:
-                try:
-                    curr_patch = self.detect_white_patch(buf, self.cached_cx, self.cached_cy, self.cached_r, buf_w)
-                except TypeError:
+                # Throttle heavy white patch detection during re-arm tracking (at most once every 15ms)
+                if (now - getattr(self, '_last_rearm_scan_time', 0.0)) >= 0.015:
                     try:
-                        curr_patch = self.detect_white_patch(buf, self.cached_cx, self.cached_cy, self.cached_r)
+                        curr_patch = self.detect_white_patch(buf, self.cached_cx, self.cached_cy, self.cached_r, buf_w)
                     except TypeError:
-                        curr_patch = self.detect_white_patch(buf)
+                        try:
+                            curr_patch = self.detect_white_patch(buf, self.cached_cx, self.cached_cy, self.cached_r)
+                        except TypeError:
+                            curr_patch = self.detect_white_patch(buf)
+                    self._last_rearm_scan_time = now
+                    self._cached_rearm_patch = curr_patch
+                else:
+                    curr_patch = getattr(self, '_cached_rearm_patch', None)
 
                 if curr_patch is None:
                     # Patch disappeared between sequential checks: unlock and prepare for next patch
@@ -1073,6 +1794,9 @@ class QTEDetector:
                     self.cached_target_angle = None
                     self.has_triggered_current_qte = False
                     self.triggered_patch_center = None
+                    self._reset_velocity_on_next_sample = True
+                    self._last_rearm_scan_time = 0.0
+                    self._cached_rearm_patch = None
                 else:
                     cp_start, cp_end, cp_center, cp_span = curr_patch
                     diff_from_triggered = 999.0
@@ -1088,10 +1812,16 @@ class QTEDetector:
                         self.cached_target_angle = self.calculate_target_angle(cp_start, cp_end, cp_center, cp_span, lead_degrees=dynamic_lead)
                         self.has_triggered_current_qte = False
                         self.triggered_patch_center = None
+                        self._reset_velocity_on_next_sample = True
+                        self._last_rearm_scan_time = 0.0
+                        self._cached_rearm_patch = None
                     elif is_past_triggered_patch and time_since_trigger >= 0.080:
                         # Needle has moved past triggered patch and minimum key separation elapsed
                         self.has_triggered_current_qte = False
                         self.triggered_patch_center = None
+                        self._reset_velocity_on_next_sample = True
+                        self._last_rearm_scan_time = 0.0
+                        self._cached_rearm_patch = None
                     elif time_since_trigger >= 0.20:
                         # Fallback for identical angle patch after needle made full loop or rotated far away
                         dist_from_start = (needle_angle - cp_start) % 360.0
@@ -1099,6 +1829,9 @@ class QTEDetector:
                         if dist_from_start > (cp_span + 15.0) and dist_to_start > 15.0:
                             self.has_triggered_current_qte = False
                             self.triggered_patch_center = None
+                            self._reset_velocity_on_next_sample = True
+                            self._last_rearm_scan_time = 0.0
+                            self._cached_rearm_patch = None
 
         # Detect or maintain locked white patch coordinates
         if self.cached_patch_center is None:
@@ -1123,6 +1856,7 @@ class QTEDetector:
                     self.cached_patch_center = p_center
                     self.cached_patch_span = p_span
                     self.cached_target_angle = self.calculate_target_angle(p_start, p_end, p_center, p_span, lead_degrees=dynamic_lead)
+                    self._reset_velocity_on_next_sample = True
         elif self.cached_patch_start is not None:
             # Refresh target angle dynamically based on current angular velocity lead
             self.cached_target_angle = self.calculate_target_angle(
@@ -1156,44 +1890,94 @@ class QTEDetector:
             # Clockwise distance from target to patch end (valid trigger sector)
             target_to_end = (p_end - target) % 360.0
             max_allowed_sector = p_span + max(5.0, dynamic_lead) + 5.0
-            is_in_target_sector = (dist_from_target <= target_to_end) and (target_to_end <= max_allowed_sector) and (target_to_end <= 60.0)
+            is_in_target_sector = (dist_from_target <= target_to_end) and (target_to_end <= max_allowed_sector) and (target_to_end <= max(60.0, max_allowed_sector))
 
             # Condition A: Clockwise crossing target angle
-            # A1: tight window for accurate per-frame crossing (<=30° step, 0.5° buffer)
+            # A1: tight window for accurate per-frame crossing (<=30° step)
             # A2: confirmed lag-spike crossing (>30° to <=180°): require target is strictly
             #     contained in [prev, curr] arc AND needle lands inside/past patch start
             if self.prev_needle_angle is not None:
                 step = (needle_angle - self.prev_needle_angle) % 360.0
                 dist_to_target = (target - self.prev_needle_angle) % 360.0
-                if 0.05 <= step <= 30.0 and dist_to_target <= (step + 0.5):
-                    should_trigger = True
-                    reason = f"Clockwise crossing target {target:.1f}° (prev={self.prev_needle_angle:.1f}°, curr={needle_angle:.1f}°, lead={dynamic_lead:.1f}°)"
-                elif 30.0 < step <= 180.0 and dist_to_target < step and dist_from_start <= (p_span + 30.0):
-                    # Large jump: target is within the arc, and needle is at or near the patch
-                    should_trigger = True
-                    reason = f"Clockwise crossing target {target:.1f}° (prev={self.prev_needle_angle:.1f}°, curr={needle_angle:.1f}°, lead={dynamic_lead:.1f}°)"
+                dist_to_start_from_prev = (p_start - self.prev_needle_angle) % 360.0
+                crossing_buffer = 0.0 if (self.hit_position == "start" and dynamic_lead <= 0.0) else 1.0
+                crossed_target = (dist_to_target <= (step + crossing_buffer))
+                crossed_start = (dist_to_start_from_prev <= (step + crossing_buffer))
+
+                if 0.05 <= step <= 30.0 and (crossed_target or crossed_start or is_inside_patch):
+                    if self.hit_position == "start":
+                        # In Violence District, early before patch start = FAIL,
+                        # but late on/after white patch = SUCCESSFUL (Good zone).
+                        max_lead = max(0.0, dynamic_lead)
+                        landing_dist = (needle_angle + max_lead - p_start) % 360.0
+                        safe_landing = (1.0 <= landing_dist <= (p_span + 25.0))
+                        if is_inside_patch:
+                            should_trigger = True
+                            reason = f"Clockwise entering white patch [{p_start:.1f}°..{p_end:.1f}°] (prev={self.prev_needle_angle:.1f}°, curr={needle_angle:.1f}°)"
+                        elif max_lead > 0.0 and safe_landing and (crossed_target or is_in_target_sector):
+                            should_trigger = True
+                            reason = f"Clockwise crossing lead target {target:.1f}° [{p_start:.1f}°..{p_end:.1f}°] (lead={dynamic_lead:.1f}°, prev={self.prev_needle_angle:.1f}°, curr={needle_angle:.1f}°)"
+                        elif dist_from_start <= (p_span + 25.0):
+                            should_trigger = True
+                            reason = f"Clockwise sweep across white patch [{p_start:.1f}°..{p_end:.1f}°] (prev={self.prev_needle_angle:.1f}°, curr={needle_angle:.1f}°: late hit)"
+                    else:
+                        should_trigger = True
+                        reason = f"Clockwise crossing target {target:.1f}° (prev={self.prev_needle_angle:.1f}°, curr={needle_angle:.1f}°, lead={dynamic_lead:.1f}°)"
+                elif 30.0 < step <= 180.0 and (dist_to_target < step or dist_to_start_from_prev < step):
+                    max_lead = max(0.0, dynamic_lead)
+                    landing_dist = (needle_angle + max_lead - p_start) % 360.0
+                    safe_landing = (1.0 <= landing_dist <= (p_span + 30.0))
+                    if is_inside_patch or (max_lead > 0.0 and safe_landing and (dist_to_target < step or is_in_target_sector)) or (dist_from_start <= (p_span + 30.0)):
+                        should_trigger = True
+                        reason = f"Clockwise jump past target {target:.1f}° (prev={self.prev_needle_angle:.1f}°, curr={needle_angle:.1f}°, lead={dynamic_lead:.1f}°)"
 
             # Condition B: Needle is at or past target inside patch/lead zone, or entering arrival lead window
             if not should_trigger:
-                if is_in_target_sector:
-                    should_trigger = True
-                    if is_inside_patch:
-                        reason = f"Needle at target inside white patch [{p_start:.1f}°..{p_end:.1f}°]"
+                if is_in_target_sector or is_inside_patch:
+                    if self.hit_position == "start":
+                        max_lead = max(0.0, dynamic_lead)
+                        landing_dist = (needle_angle + max_lead - p_start) % 360.0
+                        safe_landing = (1.0 <= landing_dist <= (p_span + 25.0))
+                        if is_inside_patch:
+                            should_trigger = True
+                            reason = f"Needle inside white patch [{p_start:.1f}°..{p_end:.1f}°]"
+                        elif max_lead > 0.0 and safe_landing and is_in_target_sector:
+                            should_trigger = True
+                            reason = f"Needle at lead target {target:.1f}° [{p_start:.1f}°..{p_end:.1f}°] (lead={dynamic_lead:.1f}°)"
                     else:
-                        reason = f"Needle at target lead angle {target:.1f}° (approaching patch [{p_start:.1f}°..{p_end:.1f}°], lead={dynamic_lead:.1f}°)"
-                elif dist_before_target <= 2.0 and (is_inside_patch or is_at_patch_lead):
+                        should_trigger = True
+                        if is_inside_patch:
+                            reason = f"Needle at target inside white patch [{p_start:.1f}°..{p_end:.1f}°]"
+                        else:
+                            reason = f"Needle at target lead angle {target:.1f}° (approaching patch [{p_start:.1f}°..{p_end:.1f}°], lead={dynamic_lead:.1f}°)"
+                elif self.hit_position != "start" and dist_before_target <= 2.0 and (is_inside_patch or is_at_patch_lead):
                     should_trigger = True
                     reason = f"Needle at target leading edge arrival lead {target:.1f}° [{p_start:.1f}°..{p_end:.1f}°]"
 
             # Condition C: First-frame detection or static image where needle is already over patch or at entrance
-            if not should_trigger and (is_inside_patch or is_at_patch_lead or is_in_target_sector) and self.prev_needle_angle is None:
-                should_trigger = True
-                reason = f"Needle detected directly over white patch [{p_start:.1f}°..{p_end:.1f}°]"
+            if not should_trigger and self.prev_needle_angle is None:
+                if self.hit_position == "start":
+                    if is_inside_patch:
+                        should_trigger = True
+                        reason = f"Needle detected directly over white patch [{p_start:.1f}°..{p_end:.1f}°]"
+                else:
+                    if is_inside_patch or is_at_patch_lead or is_in_target_sector:
+                        should_trigger = True
+                        reason = f"Needle detected directly over white patch [{p_start:.1f}°..{p_end:.1f}°]"
+
+            if self.hit_position == "start" and dist_from_start > 180.0:
+                should_trigger = False
+                reason = "Approaching patch start (early lock)"
 
             if should_trigger:
                 self.has_triggered_current_qte = True
                 self.last_trigger_time = now
                 self.triggered_patch_center = self.cached_patch_center
+                self.chain_hit_count += 1
+                self._last_rearm_scan_time = 0.0
+                self._cached_rearm_patch = None
+
+        is_chained = (self.chain_hit_count > 1) if should_trigger else (self.chain_hit_count > 0)
 
         if not should_trigger and not has_real_needle and not reason:
             reason = f"Needle contrast too low ({needle_score:.1f} < {self.min_needle_score:.1f})"
@@ -1204,8 +1988,22 @@ class QTEDetector:
             self.prev_needle_angle = needle_angle
             self.prev_needle_time = now
 
+        effective_delay_s = self.calculate_effective_delay(self.base_delay_s, needle_angle)
+
+        # Feed post-trigger frames to calibration engine for freeze detection
+        if getattr(self, 'calibration_engine', None) is not None and self.calibration_engine._is_tracking:
+            self.calibration_engine.on_frame(
+                now=now,
+                needle_angle=needle_angle if has_real_needle else None,
+                needle_score=needle_score,
+                qte_present=True
+            )
+
         self._current_frame_buf = None
         self._current_frame_glyph = None
+
+        if getattr(self, 'verbose_logging', False) and has_real_needle and self.cached_patch_start is not None:
+            print(f"[VERBOSE] Frame: Speed={self.angular_velocity:.1f}°/s | Lead={dynamic_lead:.1f}° (Target={self.cached_target_angle:.1f}°) | Trigger={should_trigger} ({reason})")
 
         return {
             'present': True,
@@ -1218,8 +2016,11 @@ class QTEDetector:
             'target_angle': self.cached_target_angle,
             'angular_velocity': self.angular_velocity,
             'dynamic_lead': dynamic_lead,
+            'effective_delay_s': effective_delay_s,
             'should_trigger': should_trigger,
-            'reason': reason
+            'reason': reason,
+            'is_chained': is_chained,
+            'chain_hit_count': self.chain_hit_count
         }
 
 # ============================================================================
@@ -1250,61 +2051,6 @@ class HotkeyManager:
         return toggle_edge, exit_edge
 
 
-DEFAULT_CONFIG = {
-    "resolution": None,
-    "center_override": None,
-    "top_bar_offset": 36,
-    "crop_size": 300,
-    "hit_position": "start",
-    "lead_degrees": 0.0,
-    "offset_degrees": 0.0,
-    "latency_ms": 30.0,
-    "min_needle_score": 35.0,
-    "hold_duration_ms": 35,
-    "debounce_seconds": 0.08,
-    "poll_interval_ms": 1,
-    "trigger_delay_ms": 12,
-    "toggle_key": "F1",
-    "exit_key": "F2",
-    "status_interval_ms": 250
-}
-
-def resolve_config_path(config_path: str = "config.json") -> str:
-    """Resolve config file path, checking cwd first then next to executable/script."""
-    if os.path.isabs(config_path):
-        return config_path
-    if os.path.exists(config_path):
-        return os.path.abspath(config_path)
-    if getattr(sys, 'frozen', False):
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.join(base_dir, config_path)
-    if os.path.exists(candidate):
-        return candidate
-    return os.path.abspath(config_path)
-
-def load_or_create_config(config_path: str = "config.json") -> Dict[str, Any]:
-    """Load configuration from JSON, or generate default config file if missing."""
-    target_path = resolve_config_path(config_path)
-    if not os.path.exists(target_path):
-        try:
-            with open(target_path, "w", encoding="utf-8") as f:
-                json.dump(DEFAULT_CONFIG, f, indent=4)
-            print(f"[CONFIG] Created default configuration file: {target_path}")
-        except Exception as e:
-            print(f"[CONFIG WARNING] Could not write default config: {e}")
-        return dict(DEFAULT_CONFIG)
-    
-    try:
-        with open(target_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        merged = dict(DEFAULT_CONFIG)
-        merged.update(cfg)
-        return merged
-    except Exception as e:
-        print(f"[CONFIG WARNING] Error loading {target_path}, falling back to defaults: {e}")
-        return dict(DEFAULT_CONFIG)
 
 # ============================================================================
 # Main Execution Loop
@@ -1320,8 +2066,8 @@ def run_macro(config_path: str = "config.json") -> None:
         pass
     cfg = load_or_create_config(config_path)
 
-    top_offset = int(cfg.get("top_bar_offset", 36))
-    crop_size = int(cfg.get("crop_size", 300))
+    top_offset = int(cfg.get("top_bar_offset", 0))
+    crop_size = int(cfg.get("crop_size", 320))
     override = cfg.get("center_override")
     res_cfg = cfg.get("resolution")
 
@@ -1362,7 +2108,11 @@ def run_macro(config_path: str = "config.json") -> None:
         offset_degrees=float(cfg.get("offset_degrees", 0.0)),
         lead_degrees=float(cfg.get("lead_degrees", 0.0)),
         latency_ms=float(cfg.get("latency_ms", 0.0)),
-        min_needle_score=float(cfg.get("min_needle_score", 35.0))
+        learned_latency_ms=float(cfg.get("learned_latency_ms", 0.0)),
+        min_needle_score=float(cfg.get("min_needle_score", 35.0)),
+        trigger_delay_ms=float(cfg.get("trigger_delay_ms", 0)),
+        config_path=config_path,
+        verbose_logging=bool(cfg.get("verbose_logging", False))
     )
     keyboard = KeyboardController(
         scancode=SPACEBAR_SCANCODE,
@@ -1376,12 +2126,20 @@ def run_macro(config_path: str = "config.json") -> None:
 
     is_paused = False
     status_interval = float(cfg.get("status_interval_ms", 250)) / 1000.0
-    trigger_delay_s = float(cfg.get("trigger_delay_ms", 12)) / 1000.0
+    trigger_delay_s = float(cfg.get("trigger_delay_ms", 0)) / 1000.0
     last_status_time = time.perf_counter()
     frame_count = 0
     hit_count = 0
     total_latency = 0.0
     was_present = False
+
+    cal_info = ""
+    if getattr(detector, 'calibration_engine', None):
+        cal_eng = detector.calibration_engine
+        if getattr(cal_eng, 'speed_calibration', None):
+            cal_info = f", {len(cal_eng.speed_calibration)} speed anchors"
+        else:
+            cal_info = f", cal_latency: {cal_eng.learned_latency_ms:.1f}ms"
 
     print("=" * 68)
     print("  Lunar Tear // Violence District QTE Auto-Skillcheck Macro")
@@ -1389,7 +2147,7 @@ def run_macro(config_path: str = "config.json") -> None:
     print(f"  [Primary Display] : {primary_mon['width']}x{primary_mon['height']} at ({primary_mon['left']}, {primary_mon['top']})")
     print(f"  [Target Center]   : {center_mode}")
     print(f"  [Capture Region]  : {crop_size}x{crop_size} from ({x1}, {y1})")
-    print(f"  [Hit Position]    : {detector.hit_position} (offset: {detector.offset_degrees:+.1f}°, lead: {detector.lead_degrees:.1f}°, latency comp: {detector.latency_ms:.0f}ms)")
+    print(f"  [Hit Position]    : {detector.hit_position} (offset: {detector.offset_degrees:+.1f}°, lead: {detector.lead_degrees:.1f}°, latency comp: {detector.latency_ms:.0f}ms{cal_info})")
     print(f"  [Keystroke Sim]   : Dual DirectInput (0x39) + VirtualKey (0x20)")
     print(f"  [Timing / Hold]   : Hold {keyboard.hold_s*1000:.0f}ms | Debounce {keyboard.debounce_s:.2f}s")
     print(f"  [Hotkeys]         : {hotkeys.toggle_name} = Toggle Pause/Resume | {hotkeys.exit_name} = Clean Exit")
@@ -1443,21 +2201,35 @@ def run_macro(config_path: str = "config.json") -> None:
                 print(f"\n[{t_now}] [QTE DETECTED] Center prompt recognized! Tracking needle...")
             was_present = result['present']
             if result['should_trigger']:
-                if trigger_delay_s > 0.0:
-                    time.sleep(trigger_delay_s)
+                eff_delay_s = result.get('effective_delay_s', trigger_delay_s)
+                if eff_delay_s > 0.0:
+                    time.sleep(eff_delay_s)
+                t_trig = time.perf_counter()
                 pressed = keyboard.trigger()
                 if pressed:
                     hit_count += 1
                     t_hit = time.strftime('%H:%M:%S', time.localtime())
                     vel_str = f" | Velocity: {result.get('angular_velocity', 0.0):.0f}°/s | Lead: {result.get('dynamic_lead', 0.0):.1f}°" if result.get('angular_velocity', 0.0) > 0.0 else ""
+                    delay_str = f" | Delay: {eff_delay_s*1000:.1f}ms (clamped from {trigger_delay_s*1000:.0f}ms)" if trigger_delay_s > 0 and eff_delay_s < trigger_delay_s else (f" | Delay: {eff_delay_s*1000:.1f}ms" if trigger_delay_s > 0 else "")
                     print(
                         f"\n[{t_hit}] [>>> HIT #{hit_count} <<<] QTE Triggered!\n"
-                        f"  -> Needle: {result['needle_angle']:.1f}° | Score: {result['needle_score']:.1f}{vel_str}\n"
+                        f"  -> Needle: {result['needle_angle']:.1f}° | Score: {result['needle_score']:.1f}{vel_str}{delay_str}\n"
                         f"  -> Patch: [{result['patch_start']:.1f}° .. {result['patch_end']:.1f}°] "
                         f"(Center: {result['patch_center']:.1f}°)\n"
                         f"  -> Target: {result['target_angle']:.1f}° | Action: Spacebar (DirectInput 0x39 + VK 0x20)\n"
                         f"  -> Reason: {result['reason']}\n"
                     )
+                    if getattr(detector, 'calibration_engine', None) is not None:
+                        detector.calibration_engine.record_trigger(
+                            trigger_time=t_trig,
+                            trigger_angle=result['needle_angle'],
+                            angular_velocity=result.get('angular_velocity', 0.0),
+                            patch_start=result['patch_start'],
+                            patch_end=result['patch_end'],
+                            patch_center=result['patch_center'],
+                            patch_span=result['patch_span'],
+                            is_chained=result.get('is_chained', False)
+                        )
                 else:
                     # Debounce cooldown or key busy: revert trigger flag so detector retries next frame
                     detector.revert_trigger()
@@ -1472,9 +2244,18 @@ def run_macro(config_path: str = "config.json") -> None:
                 fps = frame_count / (t_end - last_status_time)
                 avg_lat_ms = (total_latency / frame_count) * 1000.0 if frame_count > 0 else 0.0
                 qte_status = "ACTIVE" if result['present'] else "Idle"
+                if getattr(detector, 'calibration_engine', None):
+                    cal_eng = detector.calibration_engine
+                    last_a = getattr(cal_eng, 'last_used_anchor', None)
+                    if last_a:
+                        cal_str = f" | Cal: {last_a['speed']:.0f}°/s@{last_a['latency_ms']:.1f}ms"
+                    else:
+                        cal_str = f" | Cal: {cal_eng.learned_latency_ms:.1f}ms"
+                else:
+                    cal_str = ""
                 if sys.stdout is not None:
                     sys.stdout.write(
-                        f"\r[STATUS: RUNNING] FPS: {fps:6.1f} | Latency: {avg_lat_ms:4.2f}ms | QTE: {qte_status:<6} | Hits: {hit_count:<3}"
+                        f"\r[STATUS: RUNNING] FPS: {fps:6.1f} | Latency: {avg_lat_ms:4.2f}ms | QTE: {qte_status:<6} | Hits: {hit_count:<3}{cal_str}"
                     )
                     sys.stdout.flush()
                 last_status_time = t_end
@@ -1482,7 +2263,7 @@ def run_macro(config_path: str = "config.json") -> None:
                 total_latency = 0.0
 
             # Yield briefly to maintain CPU efficiency (<2ms frame time)
-            poll_ms = cfg.get("poll_interval_ms", 1)
+            poll_ms = cfg.get("poll_interval_ms", 0)
             if poll_ms is not None and poll_ms > 0:
                 time.sleep(poll_ms / 1000.0)
             else:
@@ -1543,7 +2324,7 @@ def run_tests(image_paths: Optional[List[str]] = None) -> bool:
     print("  Violence District QTE Detection Verification Test Suite")
     print("=" * 72)
 
-    detector = QTEDetector(crop_size=300, hit_position="start", offset_degrees=0.0)
+    detector = QTEDetector(crop_size=320, hit_position="start", offset_degrees=0.0)
     all_passed = True
 
     for p in image_paths:
@@ -1557,10 +2338,10 @@ def run_tests(image_paths: Optional[List[str]] = None) -> bool:
             continue
 
         width, height = im.size
-        # Viewport center for Roblox UI (width // 2, height // 2 + 36)
+        # Fullscreen center: default (width // 2, height // 2) with 320x320 crop
         cx = width // 2
-        cy = (height // 2) + 36
-        crop_size = 300
+        cy = height // 2
+        crop_size = 320
         crop = im.crop((cx - crop_size // 2, cy - crop_size // 2, cx + crop_size // 2, cy + crop_size // 2))
 
         # Convert crop to 32-bit BGRA bytes matching GDI DIBSection memory layout

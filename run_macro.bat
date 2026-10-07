@@ -7,7 +7,18 @@ echo   Starting Lunar Tear...
 echo ===================================================
 echo.
 
-:: Detect Python executable or Python Launcher
+:: Launch native C++ binary if available (ultra-low latency, zero runtime dependencies)
+if exist "%~dp0LunarTear.exe" (
+    "%~dp0LunarTear.exe" %*
+    if %ERRORLEVEL% NEQ 0 (
+        echo.
+        echo [ERROR] Macro stopped with exit code %ERRORLEVEL%.
+        pause
+    )
+    exit /b %ERRORLEVEL%
+)
+
+:: Detect Python executable or Python Launcher as fallback
 set PYTHON_CMD=
 where python >nul 2>nul
 if %ERRORLEVEL% EQU 0 (

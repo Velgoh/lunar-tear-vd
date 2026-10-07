@@ -1,16 +1,75 @@
 {
     "resolution": null,
     "center_override": null,
-    "top_bar_offset": 36,
-    "crop_size": 300,
+    "top_bar_offset": 0,
+    "crop_size": 320,
     "hit_position": "start",
     "lead_degrees": 0.0,
     "offset_degrees": 0.0,
     "latency_ms": 0.0,
+    "speed_calibration": [
+        {
+            "speed": 0.0,
+            "latency_ms": 18.96
+        },
+        {
+            "speed": 116.14727506137059,
+            "latency_ms": 23.22
+        },
+        {
+            "speed": 175.03465340264694,
+            "latency_ms": 28.57
+        },
+        {
+            "speed": 250,
+            "latency_ms": 20.8
+        },
+        {
+            "speed": 350,
+            "latency_ms": 11.11
+        },
+        {
+            "speed": 400.6563556969723,
+            "latency_ms": 12.48
+        },
+        {
+            "speed": 500,
+            "latency_ms": 10.5
+        },
+        {
+            "speed": 598.0796826772839,
+            "latency_ms": 8.36
+        },
+        {
+            "speed": 700,
+            "latency_ms": 7.39
+        },
+        {
+            "speed": 772.906553483706,
+            "latency_ms": 6.47
+        },
+        {
+            "speed": 838.9852414917075,
+            "latency_ms": 6.26
+        },
+        {
+            "speed": 1000,
+            "latency_ms": 5.25
+        },
+        {
+            "speed": 1064.0261697308038,
+            "latency_ms": 4.93
+        },
+        {
+            "speed": 1152.437654802876,
+            "latency_ms": 4.56
+        }
+    ],
+    "verbose_logging": false,
     "min_needle_score": 35.0,
     "hold_duration_ms": 35,
     "debounce_seconds": 0.08,
-    "poll_interval_ms": 1,
+    "poll_interval_ms": 0,
     "trigger_delay_ms": 0,
     "toggle_key": "F1",
     "exit_key": "F2",
