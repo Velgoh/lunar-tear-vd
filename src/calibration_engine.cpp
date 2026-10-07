@@ -255,7 +255,7 @@ std::optional<CalibrationResult> AdaptiveCalibrationEngine::update_learned_laten
         }
     }
 
-    if (min_diff > 50.0) {
+    if (min_diff > 30.0) {
         SpeedAnchor new_anchor;
         new_anchor.speed = angular_velocity;
         new_anchor.latency_ms = get_interpolated_latency(angular_velocity);

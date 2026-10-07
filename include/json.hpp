@@ -168,7 +168,7 @@ public:
                     if (std::modf(num_val, &intpart) == 0.0 && std::abs(num_val) < 1e15) {
                         ss << static_cast<long long>(num_val);
                     } else {
-                        ss << std::setprecision(10) << num_val;
+                        ss << std::setprecision(17) << num_val;
                     }
                 }
                 break;
@@ -311,8 +311,13 @@ private:
             if (pos < src.size() && (src[pos] == '+' || src[pos] == '-')) pos++;
             while (pos < src.size() && std::isdigit(static_cast<unsigned char>(src[pos]))) pos++;
         }
-        double n = std::stod(src.substr(start, pos - start));
-        return Value(n);
+        if (start == pos) return Value(0.0);
+        try {
+            double n = std::stod(src.substr(start, pos - start));
+            return Value(n);
+        } catch (...) {
+            return Value(0.0);
+        }
     }
 
     Value parse_string() {
@@ -332,8 +337,23 @@ private:
                 else if (esc == 'r') s += '\r';
                 else if (esc == 't') s += '\t';
                 else if (esc == 'u' && pos + 4 <= src.size()) {
-                    pos += 4; // skip basic unicode escape
-                    s += '?';
+                    std::string hex_str = src.substr(pos, 4);
+                    pos += 4;
+                    try {
+                        unsigned long code = std::stoul(hex_str, nullptr, 16);
+                        if (code < 128) {
+                            s += static_cast<char>(code);
+                        } else if (code <= 0x7FF) {
+                            s += static_cast<char>(0xC0 | ((code >> 6) & 0x1F));
+                            s += static_cast<char>(0x80 | (code & 0x3F));
+                        } else {
+                            s += static_cast<char>(0xE0 | ((code >> 12) & 0x0F));
+                            s += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+                            s += static_cast<char>(0x80 | (code & 0x3F));
+                        }
+                    } catch (...) {
+                        s += '?';
+                    }
                 } else s += esc;
             } else {
                 s += c;
@@ -351,6 +371,11 @@ private:
             return arr;
         }
         while (pos < src.size()) {
+            skip_whitespace();
+            if (peek() == ']') {
+                get();
+                break;
+            }
             arr.push_back(parse_value());
             skip_whitespace();
             char c = get();
@@ -370,6 +395,10 @@ private:
         }
         while (pos < src.size()) {
             skip_whitespace();
+            if (peek() == '}') {
+                get();
+                break;
+            }
             if (peek() != '"') break;
             Value key_val = parse_string();
             skip_whitespace();
